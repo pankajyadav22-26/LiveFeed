@@ -1,7 +1,6 @@
 import os
 import io
 from flask import Flask, request, send_file, render_template_string
-from PIL import Image
 
 app = Flask(__name__)
 
@@ -14,18 +13,18 @@ BROADCASTER_HTML = """
 <html>
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Phone Camera Broadcaster</title>
+    <title>HD Camera Broadcaster</title>
     <style>
         body { font-family: sans-serif; text-align: center; background: #222; color: #fff; margin: 0; padding: 20px; }
-        video { width: 100%; max-width: 400px; border: 2px solid #555; border-radius: 8px; }
+        video { width: 100%; max-width: 640px; border: 2px solid #555; border-radius: 8px; }
         #status { margin-top: 10px; color: #0f0; font-size: 14px; }
         .btn { padding: 10px 20px; background: #e74c3c; border: none; color: white; border-radius: 5px; cursor: pointer; font-size: 16px; margin-top: 15px; }
     </style>
 </head>
 <body>
-    <h3>🔴 Live Broadcaster</h3>
+    <h3>🔴 Live Broadcaster (HD)</h3>
     <video id="video" autoplay playsinline muted></video>
-    <canvas id="canvas" width="320" height="240" style="display:none;"></canvas>
+    <canvas id="canvas" style="display:none;"></canvas>
     <div id="status">Waiting for camera...</div>
     <button class="btn" onclick="startStream()">Start Streaming</button>
 
@@ -38,16 +37,27 @@ BROADCASTER_HTML = """
 
         async function startStream() {
             try {
-                // Request Camera (Rear camera preferred)
+                // --- UPDATE: Request HD Resolution (1920x1080) ---
+                // This is required so your AI coordinates (x=1833) fit inside the image.
                 const stream = await navigator.mediaDevices.getUserMedia({ 
-                    video: { facingMode: "environment", width: 320, height: 240 } 
+                    video: { 
+                        facingMode: "environment", 
+                        width: { ideal: 1920 }, 
+                        height: { ideal: 1080 } 
+                    } 
                 });
                 video.srcObject = stream;
-                streaming = true;
-                status.innerText = "Camera Active. Sending frames...";
                 
-                // Start Loop
-                setInterval(sendFrame, 500); // 2 FPS (Adjust speed here)
+                // Wait for video to actually load to set canvas size
+                video.onloadedmetadata = () => {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    streaming = true;
+                    status.innerText = `Camera Active: ${canvas.width}x${canvas.height}`;
+                };
+
+                // Start Sending Frames
+                setInterval(sendFrame, 1000); // 1 FPS is enough for parking
             } catch (err) {
                 status.innerText = "Error: " + err;
                 status.style.color = "red";
@@ -57,8 +67,8 @@ BROADCASTER_HTML = """
         function sendFrame() {
             if (!streaming) return;
             
-            // Draw frame to hidden canvas
-            context.drawImage(video, 0, 0, 320, 240);
+            // Draw full-size frame to hidden canvas
+            context.drawImage(video, 0, 0, canvas.width, canvas.height);
             
             // Convert to JPEG Blob and Upload
             canvas.toBlob(blob => {
@@ -67,10 +77,10 @@ BROADCASTER_HTML = """
 
                 fetch('/upload', { method: 'POST', body: formData })
                     .then(res => {
-                        if(res.ok) status.innerText = "🟢 Broadcasting Live...";
+                        if(res.ok) status.innerText = `🟢 Live: ${canvas.width}x${canvas.height}`;
                     })
-                    .catch(err => status.innerText = "⚠️ Upload Error (Server Sleeping?)");
-            }, 'image/jpeg', 0.6);
+                    .catch(err => status.innerText = "⚠️ Upload Error");
+            }, 'image/jpeg', 0.7); // 0.7 Quality (Good balance)
         }
     </script>
 </body>
