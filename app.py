@@ -7,7 +7,7 @@ app = Flask(__name__)
 # Global variable to hold the latest frame
 latest_frame = None
 
-# HTML Interface for the Phone (Broadcaster)
+# HTML Interface with AUTO-ROTATION Logic
 BROADCASTER_HTML = """
 <!DOCTYPE html>
 <html>
@@ -37,50 +37,75 @@ BROADCASTER_HTML = """
 
         async function startStream() {
             try {
-                // --- UPDATE: Request HD Resolution (1920x1080) ---
-                // This is required so your AI coordinates (x=1833) fit inside the image.
+                // 1. Request HD Resolution with 16:9 Aspect Ratio
                 const stream = await navigator.mediaDevices.getUserMedia({ 
                     video: { 
                         facingMode: "environment", 
                         width: { ideal: 1920 }, 
-                        height: { ideal: 1080 } 
+                        height: { ideal: 1080 },
+                        aspectRatio: { ideal: 1.7777777778 } 
                     } 
                 });
                 video.srcObject = stream;
                 
-                // Wait for video to actually load to set canvas size
                 video.onloadedmetadata = () => {
-                    canvas.width = video.videoWidth;
-                    canvas.height = video.videoHeight;
                     streaming = true;
-                    status.innerText = `Camera Active: ${canvas.width}x${canvas.height}`;
+                    // Initial check
+                    checkResolution();
                 };
 
-                // Start Sending Frames
-                setInterval(sendFrame, 1000); // 1 FPS is enough for parking
+                // Start Sending Frames (1 FPS)
+                setInterval(sendFrame, 1000); 
             } catch (err) {
                 status.innerText = "Error: " + err;
                 status.style.color = "red";
             }
         }
 
+        function checkResolution() {
+            const w = video.videoWidth;
+            const h = video.videoHeight;
+            // Display actual camera input resolution
+            status.innerText = `Camera Input: ${w}x${h} (Sending Landscape)`;
+        }
+
         function sendFrame() {
             if (!streaming) return;
+
+            const vW = video.videoWidth;
+            const vH = video.videoHeight;
+
+            // 2. AUTO-ROTATE LOGIC
+            // If phone sends Portrait (Height > Width), we rotate it 90 degrees manually
+            if (vH > vW) {
+                // Set canvas to Landscape dimensions (swapped)
+                canvas.width = vH;
+                canvas.height = vW;
+                
+                // Rotate Context 90 degrees
+                context.save();
+                context.translate(vH, 0);
+                context.rotate(90 * Math.PI / 180);
+                context.drawImage(video, 0, 0, vW, vH);
+                context.restore();
+            } else {
+                // Already Landscape - Draw normally
+                canvas.width = vW;
+                canvas.height = vH;
+                context.drawImage(video, 0, 0, vW, vH);
+            }
             
-            // Draw full-size frame to hidden canvas
-            context.drawImage(video, 0, 0, canvas.width, canvas.height);
-            
-            // Convert to JPEG Blob and Upload
+            // 3. Convert and Upload
             canvas.toBlob(blob => {
                 const formData = new FormData();
                 formData.append('file', blob, 'frame.jpg');
 
                 fetch('/upload', { method: 'POST', body: formData })
                     .then(res => {
-                        if(res.ok) status.innerText = `🟢 Live: ${canvas.width}x${canvas.height}`;
+                        if(res.ok) status.innerText = `🟢 Live: Sending ${canvas.width}x${canvas.height}`;
                     })
                     .catch(err => status.innerText = "⚠️ Upload Error");
-            }, 'image/jpeg', 0.7); // 0.7 Quality (Good balance)
+            }, 'image/jpeg', 0.7);
         }
     </script>
 </body>
