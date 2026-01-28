@@ -226,10 +226,12 @@ def get_latest():
         download_name='latest.jpg'
     )
 
-@app.route('/trigger_analysis', methods=['GET'])
+@app.route('/trigger_analysis', methods=['GET', 'POST']) # Change this line
 def trigger_analysis():
     global latest_frame
     
+    print("ESP32 Trigger Received!") 
+
     with data_lock:
         current_data = latest_frame
 
