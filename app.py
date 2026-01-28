@@ -226,46 +226,59 @@ def get_latest():
         download_name='latest.jpg'
     )
 
-@app.route('/trigger_analysis', methods=['GET', 'POST']) # Change this line
+@app.route('/trigger_analysis', methods=['POST'])
 def trigger_analysis():
-    global latest_frame
-    
-    print("ESP32 Trigger Received!") 
+    global latest_frame, last_updated
+
+    print("ESP32 Trigger Received!")
 
     with data_lock:
-        current_data = latest_frame
+        frame = latest_frame
+        updated_at = last_updated
 
-    if current_data is None:
-        return jsonify({"status": "error", "message": "No frame available"}), 404
+    # ESP32-SAFE: ALWAYS RETURN 200
+    if frame is None:
+        return jsonify({
+            "status": "error",
+            "message": "No frame available yet"
+        }), 200
 
-    if time.time() - last_updated > 10:
-        return jsonify({"status": "warning", "message": "Frame is stale (stream may be offline)"}), 404
-
-    if not AI_MODEL_URL or 'mock' in AI_MODEL_URL:
-         return jsonify({"status": "mock_success", "message": "AI URL not configured, returning mock data"}), 200
+    if time.time() - updated_at > 10:
+        return jsonify({
+            "status": "warning",
+            "message": "Frame is stale"
+        }), 200
 
     try:
+        # Forward frame to AI endpoint
         response = requests.post(
-            AI_MODEL_URL, 
-            data=current_data, 
+            AI_MODEL_URL,
+            data=frame,
             headers={'Content-Type': 'image/jpeg'},
-            timeout=10
+            timeout=15
         )
 
         try:
             ai_data = response.json()
-        except:
+        except Exception:
             ai_data = {"raw_response": response.text}
 
         return jsonify({
-            "status": "success", 
+            "status": "success",
             "ai_response": ai_data
         }), 200
-        
+
     except requests.exceptions.Timeout:
-        return jsonify({"status": "error", "message": "AI Service Timed Out"}), 504
+        return jsonify({
+            "status": "error",
+            "message": "AI service timeout"
+        }), 200
+
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 200
 
 @app.route('/mock_ai', methods=['POST'])
 def mock_ai():
