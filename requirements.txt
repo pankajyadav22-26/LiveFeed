@@ -3,3 +3,4 @@ gunicorn
 Pillow
 requests
 python-dotenv
+paho-mqtt
