@@ -167,29 +167,64 @@ def run_ai(source):
 
 # ===================== MQTT =====================
 def on_mqtt_connect(client, userdata, flags, rc):
-    print("[MQTT] Connected")
-    client.subscribe(MQTT_TRIGGER_TOPIC)
+    if rc == 0:
+        print("[MQTT] Connected to broker")
+        result, mid = client.subscribe(MQTT_TRIGGER_TOPIC, qos=1)
+        if result == mqtt.MQTT_ERR_SUCCESS:
+            print(f"[MQTT] Subscribed to {MQTT_TRIGGER_TOPIC}")
+        else:
+            print("[MQTT] Subscribe failed")
+    else:
+        print("[MQTT] Connection failed, rc=", rc)
+
+def on_mqtt_disconnect(client, userdata, rc):
+    print("[MQTT] Disconnected, rc=", rc)
 
 def on_mqtt_message(client, userdata, msg):
-    payload = msg.payload.decode()
+    payload = msg.payload.decode(errors="ignore")
     print(f"[MQTT] Trigger received: {payload}")
 
     result = run_ai("mqtt")
-    client.publish(MQTT_ACK_TOPIC, json.dumps(result))
+
+    client.publish(
+        MQTT_ACK_TOPIC,
+        json.dumps(result),
+        qos=1,
+        retain=False
+    )
 
     print("[MQTT] AI result published")
 
 def mqtt_worker():
-    client = mqtt.Client()
+    print("[MQTT] Starting MQTT worker")
+
+    client = mqtt.Client(
+        client_id="camera-feed-server",
+        protocol=mqtt.MQTTv311
+    )
+
     client.username_pw_set(MQTT_USER, MQTT_PASS)
     client.tls_set()
+
     client.on_connect = on_mqtt_connect
     client.on_message = on_mqtt_message
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    client.on_disconnect = on_mqtt_disconnect
+
+    client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+
     client.loop_forever()
 
 # ===================== START =====================
 if __name__ == "__main__":
-    threading.Thread(target=mqtt_worker, daemon=True).start()
-    print("[SYSTEM] Camera + AI Trigger Server Started")
-    app.run(host="0.0.0.0", port=PORT)
+    print("[SYSTEM] Starting Camera Feed Server")
+
+    mqtt_thread = threading.Thread(
+        target=mqtt_worker,
+        daemon=True
+    )
+    mqtt_thread.start()
+
+    app.run(
+        host="0.0.0.0",
+        port=PORT
+    )
