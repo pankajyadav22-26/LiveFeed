@@ -220,7 +220,7 @@ if __name__ == "__main__":
 
     mqtt_thread = threading.Thread(
         target=mqtt_worker,
-        daemon=True
+        daemon=False
     )
     mqtt_thread.start()
 
