@@ -4,6 +4,7 @@ import time
 import json
 import threading
 import requests
+import logging
 from flask import Flask, request, send_file, render_template_string, jsonify
 from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
@@ -19,6 +20,9 @@ MQTT_USER   = os.getenv("MQTT_USER")
 MQTT_PASS   = os.getenv("MQTT_PASS")
 
 app = Flask(__name__)
+
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
 
 latest_frames = {}
 lock = threading.Lock()
@@ -99,7 +103,7 @@ function capture() {
   canvas.toBlob(blob => {
     const fd = new FormData();
     fd.append("image", blob, "frame.jpg");
-    fd.append("lotPrefix", currentPrefix); // WE SEND THE PREFIX WITH THE IMAGE
+    fd.append("lotPrefix", currentPrefix); 
     fetch("/upload", { method: "POST", body: fd });
   }, "image/jpeg", 0.9);
 
@@ -151,8 +155,6 @@ def run_ai(source, lot_prefix):
         data = {"lotPrefix": lot_prefix} 
 
         r = requests.post(AI_MODEL_URL, files=files, data=data, timeout=30)
-        
-        print(f"[AI] Triggered {lot_prefix} | http={r.status_code}")
         return {"status": "success", "source": source, "ai_response": r.json()}
 
     except Exception as e:
@@ -161,23 +163,21 @@ def run_ai(source, lot_prefix):
 
 def on_mqtt_connect(client, userdata, flags, rc):
     if rc == 0:
-        print("[MQTT] Connected to broker")
+        print("[MQTT] Connected to broker. Listening for AI triggers...")
         client.subscribe("/esp32/ai/trigger/+", qos=1)
-        print("[MQTT] Subscribed to /esp32/ai/trigger/+")
     else:
-        print("[MQTT] Connection failed, rc=", rc)
+        print(f"[MQTT] Connection failed, rc={rc}")
 
 def on_mqtt_message(client, userdata, msg):
     lot_prefix = msg.topic.split("/")[-1] 
-    
     payload = msg.payload.decode(errors="ignore")
-    print(f"[MQTT] Trigger for {lot_prefix}: {payload}")
+    
+    print(f"[Trigger] {lot_prefix} -> {payload}")
 
     result = run_ai("mqtt", lot_prefix)
 
     ack_topic = f"/esp32/ai/ack/{lot_prefix}"
     client.publish(ack_topic, json.dumps(result), qos=1)
-    print(f"[MQTT] AI result published to {ack_topic}")
 
 def mqtt_worker():
     client = mqtt.Client(client_id="global-camera-portal", protocol=mqtt.MQTTv311)
@@ -189,6 +189,6 @@ def mqtt_worker():
     client.loop_forever()
 
 if __name__ == "__main__":
-    print("[SYSTEM] Starting Global Camera Portal")
+    print("[SYSTEM] Global Camera Portal Starting...")
     threading.Thread(target=mqtt_worker, daemon=False).start()
     app.run(host="0.0.0.0", port=PORT)
