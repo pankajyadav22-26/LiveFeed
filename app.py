@@ -8,74 +8,85 @@ from flask import Flask, request, send_file, render_template_string, jsonify
 from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
 
-# ===================== ENV =====================
 load_dotenv()
 
-AI_MODEL_URL = os.getenv("AI_MODEL_URL")
+AI_MODEL_URL = os.getenv("AI_MODEL_URL", "http://localhost:5002/process_image")
+PORT = int(os.getenv("PORT", 5001))
 
 MQTT_BROKER = os.getenv("MQTT_BROKER")
-MQTT_PORT   = int(os.getenv("MQTT_PORT"))
+MQTT_PORT   = int(os.getenv("MQTT_PORT", 8883))
 MQTT_USER   = os.getenv("MQTT_USER")
 MQTT_PASS   = os.getenv("MQTT_PASS")
 
-MQTT_TRIGGER_TOPIC = "/esp32/ai/trigger"
-MQTT_ACK_TOPIC     = "/esp32/ai/ack"
-
-PORT = int(os.getenv("PORT", 5001))
-
-# ===================== APP =====================
 app = Flask(__name__)
 
-latest_frame = None
-last_updated = 0
+latest_frames = {}
 lock = threading.Lock()
 
-# ===================== HTML (Render HTTPS compatible) =====================
 BROADCASTER_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>Smart Parking Camera</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ParkEase Global Camera</title>
 <style>
-body{background:#111;color:#fff;font-family:sans-serif;text-align:center}
-video{width:100%;max-width:1000px}
-button{padding:12px 24px;font-size:16px;margin-top:10px}
+body{background:#111;color:#fff;font-family:sans-serif;text-align:center; padding: 20px;}
+video{width:100%;max-width:800px; border: 2px solid #4CAF50; border-radius: 10px;}
+input{padding: 10px; font-size: 16px; width: 80%; max-width: 300px; margin-bottom: 15px; border-radius: 5px; text-align: center;}
+button{padding:12px 24px;font-size:16px;margin-top:10px; background: #4CAF50; color: white; border: none; border-radius: 5px; cursor: pointer;}
+button:disabled {background: #555;}
 </style>
 </head>
 <body>
 
-<h2>📷 Camera Feed</h2>
-<video id="video" autoplay muted playsinline></video>
-<canvas id="canvas" style="display:none"></canvas>
-<p id="status">Idle</p>
+<h2>📷 ParkEase Camera Portal</h2>
+<p>Enter your Parking Lot Prefix to begin broadcasting:</p>
+<input type="text" id="lotPrefix" placeholder="e.g. lot_nitd_MiniCampus" required>
+<br>
 <button id="start">Start Camera</button>
+
+<div id="videoContainer" style="display:none; margin-top: 20px;">
+    <video id="video" autoplay muted playsinline></video>
+    <p id="status" style="color: #4CAF50; font-weight: bold;">Broadcasting...</p>
+</div>
+<canvas id="canvas" style="display:none"></canvas>
 
 <script>
 const video  = document.getElementById("video");
 const canvas = document.getElementById("canvas");
 const ctx    = canvas.getContext("2d");
 const status = document.getElementById("status");
+const startBtn = document.getElementById("start");
+const lotInput = document.getElementById("lotPrefix");
+const videoContainer = document.getElementById("videoContainer");
 
-document.getElementById("start").onclick = async () => {
+let currentPrefix = "";
+
+startBtn.onclick = async () => {
+  if (!lotInput.value) {
+      alert("Please enter a Lot Prefix!");
+      return;
+  }
+  
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    alert("Camera not supported");
+    alert("Camera not supported on this browser.");
     return;
   }
 
+  currentPrefix = lotInput.value.trim();
+  lotInput.disabled = true;
+  startBtn.style.display = "none";
+  videoContainer.style.display = "block";
+
   const stream = await navigator.mediaDevices.getUserMedia({
-    video: {
-      facingMode: "environment",
-      width:  { ideal: 1920 },
-      height: { ideal: 1080 }
-    }
+    video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } }
   });
 
   video.srcObject = stream;
 
   video.onloadedmetadata = () => {
-    status.innerText =
-      `Camera Ready: ${video.videoWidth}x${video.videoHeight}`;
+    status.innerText = `Broadcasting as: ${currentPrefix}`;
     capture();
   };
 };
@@ -88,6 +99,7 @@ function capture() {
   canvas.toBlob(blob => {
     const fd = new FormData();
     fd.append("image", blob, "frame.jpg");
+    fd.append("lotPrefix", currentPrefix); // WE SEND THE PREFIX WITH THE IMAGE
     fetch("/upload", { method: "POST", body: fd });
   }, "image/jpeg", 0.9);
 
@@ -99,132 +111,84 @@ function capture() {
 </html>
 """
 
-# ===================== ROUTES =====================
 @app.route("/")
 def index():
     return render_template_string(BROADCASTER_HTML)
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    global latest_frame, last_updated
-
-    if "image" not in request.files:
-        return "Missing image", 400
+    lot_prefix = request.form.get("lotPrefix")
+    
+    if not lot_prefix or "image" not in request.files:
+        return "Missing data", 400
 
     buf = io.BytesIO()
     request.files["image"].save(buf)
 
     with lock:
-        latest_frame = buf.getvalue()
-        last_updated = time.time()
+        latest_frames[lot_prefix] = {
+            "frame": buf.getvalue(),
+            "ts": time.time()
+        }
 
     return "OK", 200
 
-@app.route("/latest.jpg")
-def latest():
+def run_ai(source, lot_prefix):
     with lock:
-        if latest_frame is None:
-            return "No frame", 404
-        return send_file(io.BytesIO(latest_frame), mimetype="image/jpeg")
+        lot_data = latest_frames.get(lot_prefix)
 
-@app.route("/trigger_analysis", methods=["POST"])
-def trigger_manual():
-    return jsonify(run_ai("manual")), 200
+    if not lot_data:
+        return {"status": "error", "message": f"No camera currently streaming for {lot_prefix}"}
 
-# ===================== AI CORE =====================
-def run_ai(source):
-    with lock:
-        frame = latest_frame
-        ts    = last_updated
+    frame = lot_data["frame"]
+    ts = lot_data["ts"]
 
-    if frame is None:
-        return {"status": "error", "message": "No frame available"}
-
-    if time.time() - ts > 10:
-        return {"status": "warning", "message": "Frame too old"}
+    if time.time() - ts > 15:
+        return {"status": "warning", "message": "Frame too old, camera might be disconnected"}
 
     try:
-        files = {
-            "image": ("frame.jpg", frame, "image/jpeg")
-        }
+        files = {"image": ("frame.jpg", frame, "image/jpeg")}
+        data = {"lotPrefix": lot_prefix} 
 
-        r = requests.post(AI_MODEL_URL, files=files, timeout=30)
-
-        print(
-            f"[AI] Triggered | source={source} | "
-            f"bytes={len(frame)} | http={r.status_code}"
-        )
-
-        return {
-            "status": "success",
-            "source": source,
-            "ai_response": r.json()
-        }
+        r = requests.post(AI_MODEL_URL, files=files, data=data, timeout=30)
+        
+        print(f"[AI] Triggered {lot_prefix} | http={r.status_code}")
+        return {"status": "success", "source": source, "ai_response": r.json()}
 
     except Exception as e:
-        print("[AI] ERROR:", e)
+        print(f"[{lot_prefix} AI] ERROR:", e)
         return {"status": "error", "message": str(e)}
 
-# ===================== MQTT =====================
 def on_mqtt_connect(client, userdata, flags, rc):
     if rc == 0:
         print("[MQTT] Connected to broker")
-        result, mid = client.subscribe(MQTT_TRIGGER_TOPIC, qos=1)
-        if result == mqtt.MQTT_ERR_SUCCESS:
-            print(f"[MQTT] Subscribed to {MQTT_TRIGGER_TOPIC}")
-        else:
-            print("[MQTT] Subscribe failed")
+        client.subscribe("/esp32/ai/trigger/+", qos=1)
+        print("[MQTT] Subscribed to /esp32/ai/trigger/+")
     else:
         print("[MQTT] Connection failed, rc=", rc)
 
-def on_mqtt_disconnect(client, userdata, rc):
-    print("[MQTT] Disconnected, rc=", rc)
-
 def on_mqtt_message(client, userdata, msg):
+    lot_prefix = msg.topic.split("/")[-1] 
+    
     payload = msg.payload.decode(errors="ignore")
-    print(f"[MQTT] Trigger received: {payload}")
+    print(f"[MQTT] Trigger for {lot_prefix}: {payload}")
 
-    result = run_ai("mqtt")
+    result = run_ai("mqtt", lot_prefix)
 
-    client.publish(
-        MQTT_ACK_TOPIC,
-        json.dumps(result),
-        qos=1,
-        retain=False
-    )
-
-    print("[MQTT] AI result published")
+    ack_topic = f"/esp32/ai/ack/{lot_prefix}"
+    client.publish(ack_topic, json.dumps(result), qos=1)
+    print(f"[MQTT] AI result published to {ack_topic}")
 
 def mqtt_worker():
-    print("[MQTT] Starting MQTT worker")
-
-    client = mqtt.Client(
-        client_id="camera-feed-server",
-        protocol=mqtt.MQTTv311
-    )
-
+    client = mqtt.Client(client_id="global-camera-portal", protocol=mqtt.MQTTv311)
     client.username_pw_set(MQTT_USER, MQTT_PASS)
     client.tls_set()
-
     client.on_connect = on_mqtt_connect
     client.on_message = on_mqtt_message
-    client.on_disconnect = on_mqtt_disconnect
-
     client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-
     client.loop_forever()
 
-# ===================== START =====================
 if __name__ == "__main__":
-    print("[SYSTEM] Starting Camera Feed Server")
-
-    mqtt_thread = threading.Thread(
-        target=mqtt_worker,
-        daemon=False
-    )
-    mqtt_thread.start()
-
-    app.run(
-        host="0.0.0.0",
-        port=PORT
-    )
+    print("[SYSTEM] Starting Global Camera Portal")
+    threading.Thread(target=mqtt_worker, daemon=False).start()
+    app.run(host="0.0.0.0", port=PORT)
