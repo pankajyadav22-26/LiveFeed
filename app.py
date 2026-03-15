@@ -5,7 +5,7 @@ import json
 import threading
 import requests
 import logging
-from flask import Flask, request, send_file, render_template_string, jsonify
+from flask import Flask, request, render_template_string, jsonify
 from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
 
@@ -20,12 +20,14 @@ MQTT_USER   = os.getenv("MQTT_USER")
 MQTT_PASS   = os.getenv("MQTT_PASS")
 
 app = Flask(__name__)
-
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
 latest_frames = {}
+pending_triggers = {}
 lock = threading.Lock()
+
+mqtt_client_global = None
 
 BROADCASTER_HTML = """
 <!DOCTYPE html>
@@ -36,15 +38,17 @@ BROADCASTER_HTML = """
 <title>ParkEase Global Camera</title>
 <style>
 body{background:#111;color:#fff;font-family:sans-serif;text-align:center; padding: 20px;}
-video{width:100%;max-width:800px; border: 2px solid #4CAF50; border-radius: 10px;}
+video{width:100%;max-width:800px; border: 2px solid #555; border-radius: 10px; transition: border 0.3s;}
 input{padding: 10px; font-size: 16px; width: 80%; max-width: 300px; margin-bottom: 15px; border-radius: 5px; text-align: center;}
 button{padding:12px 24px;font-size:16px;margin-top:10px; background: #4CAF50; color: white; border: none; border-radius: 5px; cursor: pointer;}
-button:disabled {background: #555;}
+.status-badge { margin-top: 15px; padding: 10px; border-radius: 8px; font-weight: bold; display: none; }
+.idle { background: #333; color: #aaa; }
+.active { background: #E8F5E9; color: #2E7D32; border: 2px solid #4CAF50; }
 </style>
 </head>
 <body>
 
-<h2>📷 ParkEase Camera Portal</h2>
+<h2>📷 ParkEase Camera Node</h2>
 <p>Enter your Parking Lot Prefix to begin broadcasting:</p>
 <input type="text" id="lotPrefix" placeholder="e.g. lot_nitd_MiniCampus" required>
 <br>
@@ -52,7 +56,7 @@ button:disabled {background: #555;}
 
 <div id="videoContainer" style="display:none; margin-top: 20px;">
     <video id="video" autoplay muted playsinline></video>
-    <p id="status" style="color: #4CAF50; font-weight: bold;">Broadcasting...</p>
+    <div id="statusBadge" class="status-badge idle">🔋 Camera on Standby (Battery Saver)</div>
 </div>
 <canvas id="canvas" style="display:none"></canvas>
 
@@ -60,42 +64,59 @@ button:disabled {background: #555;}
 const video  = document.getElementById("video");
 const canvas = document.getElementById("canvas");
 const ctx    = canvas.getContext("2d");
-const status = document.getElementById("status");
 const startBtn = document.getElementById("start");
 const lotInput = document.getElementById("lotPrefix");
 const videoContainer = document.getElementById("videoContainer");
+const statusBadge = document.getElementById("statusBadge");
 
 let currentPrefix = "";
 
 startBtn.onclick = async () => {
-  if (!lotInput.value) {
-      alert("Please enter a Lot Prefix!");
-      return;
-  }
+  if (!lotInput.value) { alert("Please enter a Lot Prefix!"); return; }
   
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    alert("Camera not supported on this browser.");
-    return;
+    alert("Camera not supported on this browser."); return;
   }
 
   currentPrefix = lotInput.value.trim();
   lotInput.disabled = true;
   startBtn.style.display = "none";
   videoContainer.style.display = "block";
+  statusBadge.style.display = "inline-block";
 
   const stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } }
+    video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } }
   });
 
   video.srcObject = stream;
 
   video.onloadedmetadata = () => {
-    status.innerText = `Broadcasting as: ${currentPrefix}`;
-    capture();
+    pollForTrigger();
+    
+    setInterval(() => {
+        captureFrame("periodic");
+    }, 60000); 
   };
 };
 
-function capture() {
+async function pollForTrigger() {
+    try {
+        let res = await fetch(`/check_trigger/${currentPrefix}`);
+        let data = await res.json();
+        
+        if (data.capture === true) {
+            captureFrame(data.source);
+        }
+    } catch(e) {}
+    
+    setTimeout(pollForTrigger, 300);
+}
+
+function captureFrame(sourceTrigger) {
+  statusBadge.className = "status-badge active";
+  statusBadge.innerText = `📸 Capturing (${sourceTrigger})...`;
+  video.style.borderColor = "#4CAF50";
+
   canvas.width  = video.videoWidth;
   canvas.height = video.videoHeight;
   ctx.drawImage(video, 0, 0);
@@ -104,10 +125,16 @@ function capture() {
     const fd = new FormData();
     fd.append("image", blob, "frame.jpg");
     fd.append("lotPrefix", currentPrefix); 
-    fetch("/upload", { method: "POST", body: fd });
-  }, "image/jpeg", 0.9);
-
-  setTimeout(capture, 1000);
+    fd.append("source", sourceTrigger); 
+    
+    fetch("/upload", { method: "POST", body: fd }).then(() => {
+        setTimeout(() => {
+            statusBadge.className = "status-badge idle";
+            statusBadge.innerText = "Camera on Standby";
+            video.style.borderColor = "#555";
+        }, 1000);
+    });
+  }, "image/jpeg", 0.8);
 }
 </script>
 
@@ -119,47 +146,73 @@ function capture() {
 def index():
     return render_template_string(BROADCASTER_HTML)
 
+@app.route("/check_trigger/<lot_prefix>")
+def check_trigger(lot_prefix):
+    with lock:
+        if lot_prefix in pending_triggers:
+            source = pending_triggers.pop(lot_prefix)
+            return jsonify({"capture": True, "source": source})
+    return jsonify({"capture": False})
+
 @app.route("/upload", methods=["POST"])
 def upload():
     lot_prefix = request.form.get("lotPrefix")
+    source = request.form.get("source", "periodic")
     
     if not lot_prefix or "image" not in request.files:
         return "Missing data", 400
 
     buf = io.BytesIO()
     request.files["image"].save(buf)
+    frame_bytes = buf.getvalue()
 
     with lock:
         latest_frames[lot_prefix] = {
-            "frame": buf.getvalue(),
+            "frame": frame_bytes,
             "ts": time.time()
         }
 
+    if source == "mqtt_entrance" or source == "mqtt_exit":
+        threading.Thread(target=process_and_ack, args=(lot_prefix, frame_bytes, source)).start()
+
     return "OK", 200
 
-def run_ai(source, lot_prefix):
-    with lock:
-        lot_data = latest_frames.get(lot_prefix)
-
-    if not lot_data:
-        return {"status": "error", "message": f"No camera currently streaming for {lot_prefix}"}
-
-    frame = lot_data["frame"]
-    ts = lot_data["ts"]
-
-    if time.time() - ts > 15:
-        return {"status": "warning", "message": "Frame too old, camera might be disconnected"}
-
+def process_and_ack(lot_prefix, frame_bytes, source):
+    """Runs the AI model and sends the result back to the ESP32"""
     try:
-        files = {"image": ("frame.jpg", frame, "image/jpeg")}
-        data = {"lotPrefix": lot_prefix} 
+        print(f"[AI Process] Analyzing on-demand frame for {lot_prefix}...")
+        files = {"image": ("frame.jpg", frame_bytes, "image/jpeg")}
+        data = {"lotPrefix": lot_prefix, "source": source} 
 
         r = requests.post(AI_MODEL_URL, files=files, data=data, timeout=30)
-        return {"status": "success", "source": source, "ai_response": r.json()}
+        ai_resp = r.json()
+        
+        result = {"status": "success", "source": source, "ai_response": ai_resp}
+        
+        if ai_resp.get("emergency") == True:
+            print("\n[🚨 CRITICAL] EMERGENCY VEHICLE DETECTED!")
+            print(f"[🚨 CRITICAL] Bypassing Cloud. Sending local Open Command to {lot_prefix} gate...\n")
+            
+            gate_topic = f"/esp32/gate/open/{lot_prefix}"
+            emergency_payload = json.dumps({
+                "command": "open", 
+                "reservationId": "EMERGENCY_PREEMPTION"
+            })
+            
+            if mqtt_client_global:
+                mqtt_client_global.publish(gate_topic, emergency_payload, qos=1)
+
+        ack_topic = f"/esp32/ai/ack/{lot_prefix}"
+        if mqtt_client_global:
+            mqtt_client_global.publish(ack_topic, json.dumps(result), qos=1)
+            print(f"[MQTT] Sent ACK to {ack_topic}")
 
     except Exception as e:
         print(f"[{lot_prefix} AI] ERROR:", e)
-        return {"status": "error", "message": str(e)}
+        error_result = {"status": "error", "message": str(e)}
+        if mqtt_client_global:
+            mqtt_client_global.publish(f"/esp32/ai/ack/{lot_prefix}", json.dumps(error_result), qos=1)
+
 
 def on_mqtt_connect(client, userdata, flags, rc):
     if rc == 0:
@@ -171,24 +224,37 @@ def on_mqtt_connect(client, userdata, flags, rc):
 def on_mqtt_message(client, userdata, msg):
     lot_prefix = msg.topic.split("/")[-1] 
     payload = msg.payload.decode(errors="ignore")
+    print(f"\n[Trigger] ESP32 requested frame: {lot_prefix} -> {payload}")
     
-    print(f"[Trigger] {lot_prefix} -> {payload}")
+    try:
+        doc = json.loads(payload)
+        event_type = doc.get("event", "mqtt_unknown")
+    except:
+        event_type = "mqtt_unknown"
 
-    result = run_ai("mqtt", lot_prefix)
+    with lock:
+        pending_triggers[lot_prefix] = event_type
 
-    ack_topic = f"/esp32/ai/ack/{lot_prefix}"
-    client.publish(ack_topic, json.dumps(result), qos=1)
 
 def mqtt_worker():
-    client = mqtt.Client(client_id="global-camera-portal", protocol=mqtt.MQTTv311)
-    client.username_pw_set(MQTT_USER, MQTT_PASS)
-    client.tls_set()
-    client.on_connect = on_mqtt_connect
-    client.on_message = on_mqtt_message
-    client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-    client.loop_forever()
+    global mqtt_client_global
+    mqtt_client_global = mqtt.Client(client_id="global-camera-portal", protocol=mqtt.MQTTv311)
+    mqtt_client_global.username_pw_set(MQTT_USER, MQTT_PASS)
+    mqtt_client_global.tls_set()
+    mqtt_client_global.on_connect = on_mqtt_connect
+    mqtt_client_global.on_message = on_mqtt_message
+    
+    while True:
+        try:
+            mqtt_client_global.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+            break
+        except Exception as e:
+            print(f"[MQTT] Retrying connection in 5s... ({e})")
+            time.sleep(5)
+            
+    mqtt_client_global.loop_forever()
 
 if __name__ == "__main__":
-    print("[SYSTEM] Global Camera Portal Starting...")
-    threading.Thread(target=mqtt_worker, daemon=False).start()
+    print("[SYSTEM] Global Camera Portal Starting in Battery Saver Mode...")
+    threading.Thread(target=mqtt_worker, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT)
