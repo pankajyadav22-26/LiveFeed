@@ -9,7 +9,14 @@ from flask import Flask, request, render_template_string, jsonify
 from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
 
+# --- SYSTEM CONFIGURATION ---
 load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
+
+# Suppress noisy Flask logs
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
 
 AI_MODEL_URL = os.getenv("AI_MODEL_URL", "http://localhost:5002/process_image")
 PORT = int(os.getenv("PORT", 5001))
@@ -20,15 +27,14 @@ MQTT_USER   = os.getenv("MQTT_USER")
 MQTT_PASS   = os.getenv("MQTT_PASS")
 
 app = Flask(__name__)
-log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)
 
+# --- STATE VARIABLES ---
 latest_frames = {}
 pending_triggers = {}
 lock = threading.Lock()
-
 mqtt_client_global = None
 
+# --- FRONTEND UI ---
 BROADCASTER_HTML = """
 <!DOCTYPE html>
 <html>
@@ -92,22 +98,20 @@ startBtn.onclick = async () => {
 
   video.onloadedmetadata = () => {
     pollForTrigger();
-    
-    setInterval(() => {
-        captureFrame("periodic");
-    }, 60000); 
+    setInterval(() => { captureFrame("periodic"); }, 60000); 
   };
 };
 
 async function pollForTrigger() {
     try {
         let res = await fetch(`/check_trigger/${currentPrefix}`);
-        let data = await res.json();
-        
-        if (data.capture === true) {
-            captureFrame(data.source);
+        if (res.ok) {
+            let data = await res.json();
+            if (data.capture === true) {
+                captureFrame(data.source);
+            }
         }
-    } catch(e) {}
+    } catch(e) { console.error("Polling error:", e); }
     
     setTimeout(pollForTrigger, 300);
 }
@@ -127,20 +131,21 @@ function captureFrame(sourceTrigger) {
     fd.append("lotPrefix", currentPrefix); 
     fd.append("source", sourceTrigger); 
     
-    fetch("/upload", { method: "POST", body: fd }).then(() => {
+    fetch("/upload", { method: "POST", body: fd }).finally(() => {
         setTimeout(() => {
             statusBadge.className = "status-badge idle";
-            statusBadge.innerText = "Camera on Standby";
+            statusBadge.innerText = "🔋 Camera on Standby";
             video.style.borderColor = "#555";
         }, 1000);
     });
   }, "image/jpeg", 0.8);
 }
 </script>
-
 </body>
 </html>
 """
+
+# --- ROUTES ---
 
 @app.route("/")
 def index():
@@ -149,8 +154,8 @@ def index():
 @app.route("/check_trigger/<lot_prefix>")
 def check_trigger(lot_prefix):
     with lock:
-        if lot_prefix in pending_triggers:
-            source = pending_triggers.pop(lot_prefix)
+        source = pending_triggers.pop(lot_prefix, None)
+        if source:
             return jsonify({"capture": True, "source": source})
     return jsonify({"capture": False})
 
@@ -172,89 +177,100 @@ def upload():
             "ts": time.time()
         }
 
-    if source == "mqtt_entrance" or source == "mqtt_exit":
-        threading.Thread(target=process_and_ack, args=(lot_prefix, frame_bytes, source)).start()
+    # Trigger AI processing for high-priority events
+    if source in ["mqtt_entrance", "mqtt_exit", "siren"]:
+        threading.Thread(target=process_and_ack, args=(lot_prefix, frame_bytes, source), daemon=True).start()
 
     return "OK", 200
 
+# --- CORE LOGIC ---
+
 def process_and_ack(lot_prefix, frame_bytes, source):
-    """Runs the AI model and sends the result back to the ESP32"""
+    """Sends frame to AI Engine and routes the response via MQTT."""
     try:
-        print(f"[AI Process] Analyzing on-demand frame for {lot_prefix}...")
+        logger.info(f"Analyzing on-demand frame for {lot_prefix} (Trigger: {source})")
         files = {"image": ("frame.jpg", frame_bytes, "image/jpeg")}
         data = {"lotPrefix": lot_prefix, "source": source} 
 
         r = requests.post(AI_MODEL_URL, files=files, data=data, timeout=30)
+        r.raise_for_status()
         ai_resp = r.json()
         
         result = {"status": "success", "source": source, "ai_response": ai_resp}
         
+        # 1. Handle Critical Emergency Preemption
         if ai_resp.get("emergency") == True:
-            print("\n[🚨 CRITICAL] EMERGENCY VEHICLE DETECTED!")
-            print(f"[🚨 CRITICAL] Bypassing Cloud. Sending local Open Command to {lot_prefix} gate...\n")
+            logger.warning(f"🚨 EMERGENCY VEHICLE DETECTED AT {lot_prefix}!")
+            logger.warning("Bypassing Cloud. Sending local Open Command to gate...")
             
-            gate_topic = f"/esp32/gate/open/{lot_prefix}"
+            gate_topic = f"/esp32/gate/emergency/lot/{lot_prefix}"
             emergency_payload = json.dumps({
                 "command": "open", 
                 "reservationId": "EMERGENCY_PREEMPTION"
             })
             
-            if mqtt_client_global:
+            if mqtt_client_global and mqtt_client_global.is_connected():
                 mqtt_client_global.publish(gate_topic, emergency_payload, qos=1)
 
+        # 2. Send Standard Acknowledgment
         ack_topic = f"/esp32/ai/ack/{lot_prefix}"
-        if mqtt_client_global:
+        if mqtt_client_global and mqtt_client_global.is_connected():
             mqtt_client_global.publish(ack_topic, json.dumps(result), qos=1)
-            print(f"[MQTT] Sent ACK to {ack_topic}")
+            logger.info(f"Sent AI acknowledgment to {ack_topic}")
 
     except Exception as e:
-        print(f"[{lot_prefix} AI] ERROR:", e)
+        logger.error(f"[{lot_prefix} AI Error]: {e}")
         error_result = {"status": "error", "message": str(e)}
-        if mqtt_client_global:
+        if mqtt_client_global and mqtt_client_global.is_connected():
             mqtt_client_global.publish(f"/esp32/ai/ack/{lot_prefix}", json.dumps(error_result), qos=1)
 
+# --- MQTT SETUP ---
 
 def on_mqtt_connect(client, userdata, flags, rc):
     if rc == 0:
-        print("[MQTT] Connected to broker. Listening for AI triggers...")
+        logger.info("Connected to MQTT broker. Listening for AI triggers...")
         client.subscribe("/esp32/ai/trigger/+", qos=1)
     else:
-        print(f"[MQTT] Connection failed, rc={rc}")
+        logger.error(f"MQTT Connection failed. Return code: {rc}")
 
 def on_mqtt_message(client, userdata, msg):
     lot_prefix = msg.topic.split("/")[-1] 
     payload = msg.payload.decode(errors="ignore")
-    print(f"\n[Trigger] ESP32 requested frame: {lot_prefix} -> {payload}")
+    logger.info(f"ESP32 requested frame: {lot_prefix} -> {payload}")
     
     try:
         doc = json.loads(payload)
         event_type = doc.get("event", "mqtt_unknown")
-    except:
+    except json.JSONDecodeError:
         event_type = "mqtt_unknown"
 
     with lock:
         pending_triggers[lot_prefix] = event_type
 
-
-def mqtt_worker():
+def start_mqtt():
     global mqtt_client_global
     mqtt_client_global = mqtt.Client(client_id="global-camera-portal", protocol=mqtt.MQTTv311)
-    mqtt_client_global.username_pw_set(MQTT_USER, MQTT_PASS)
-    mqtt_client_global.tls_set()
+    
+    if MQTT_USER and MQTT_PASS:
+        mqtt_client_global.username_pw_set(MQTT_USER, MQTT_PASS)
+        try:
+            mqtt_client_global.tls_set()
+        except Exception as e:
+            logger.warning(f"Could not set TLS: {e}. Proceeding without encryption.")
+
     mqtt_client_global.on_connect = on_mqtt_connect
     mqtt_client_global.on_message = on_mqtt_message
     
     while True:
         try:
             mqtt_client_global.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+            mqtt_client_global.loop_start() 
             break
         except Exception as e:
-            print(f"[MQTT] Retrying connection in 5s... ({e})")
+            logger.error(f"Retrying connection in 5s... ({e})")
             time.sleep(5)
-            
-    mqtt_client_global.loop_forever()
 
 if __name__ == "__main__":
-    print("[SYSTEM] Global Camera Portal Starting in Battery Saver Mode...")
-    threading.Thread(target=mqtt_worker, daemon=True).start()
+    logger.info("Global Camera Portal Starting in Battery Saver Mode...")
+    threading.Thread(target=start_mqtt, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT)
